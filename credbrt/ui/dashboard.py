@@ -1,8 +1,6 @@
 """Live terminal dashboard for Credential_BRT.
 
-Layout inspired by Claude Code's terminal aesthetic: a clean header
-bar, calm typographic hierarchy, and focused panels rather than a
-cluttered wall of numbers.
+Enhanced with real-time stats, geo info, device tracking, and threat intel status.
 """
 import time
 from collections import deque, defaultdict
@@ -27,17 +25,48 @@ class Dashboard:
         self.risk_engine = risk_engine
         self.notifier = notifier
         self.cfg = cfg
-        self.attempt_history = deque(maxlen=120)   # per-tick counts for sparkline
+        self.attempt_history = deque(maxlen=120)
         self.recent_stream = deque(maxlen=12)
-        self._last_seen_id = 0
-
-    # ---------- data collection ----------
+        self._stats = {
+            "total_attempts": 0,
+            "total_failed": 0,
+            "total_success": 0,
+            "unique_ips": set(),
+            "unique_accounts": set(),
+            "threat_ips": 0,
+            "alerts_fired": 0,
+            "countries_seen": set(),
+        }
 
     def _pull_new_attempts(self):
         rows = self.db.recent_attempts(seconds=15, limit=200)
         for ts, ip, account, success, ua, country, asn in rows:
-            self.recent_stream.appendleft((ts, ip, account, bool(success)))
+            self.recent_stream.appendleft((ts, ip, account, bool(success), country))
+            self._stats["total_attempts"] += 1
+            if success:
+                self._stats["total_success"] += 1
+            else:
+                self._stats["total_failed"] += 1
+            self._stats["unique_ips"].add(ip)
+            self._stats["unique_accounts"].add(account)
+            if country and country != "??":
+                self._stats["countries_seen"].add(country)
         return len(rows)
+
+    def _get_threat_count(self):
+        """Count IPs flagged by threat intel."""
+        with self.db.cursor() as cur:
+            cur.execute("SELECT COUNT(DISTINCT ip) FROM threat_intel")
+            return cur.fetchone()[0]
+
+    def _get_alert_stats(self):
+        """Get alert statistics."""
+        with self.db.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM alerts")
+            total = cur.fetchone()[0]
+            cur.execute("SELECT tier, COUNT(*) FROM alerts GROUP BY tier")
+            by_tier = dict(cur.fetchall())
+        return total, by_tier
 
     def _top_offenders(self, limit=8):
         since = time.time() - self.cfg["detection"]["low_and_slow_window_seconds"]
@@ -58,8 +87,6 @@ class Dashboard:
             self.notifier.maybe_alert(rs)
         return scores, acct_scores
 
-    # ---------- rendering ----------
-
     def _render_header(self):
         title = Text("CREDENTIAL_BRT", style="app.title")
         subtitle = Text("  brute-force & credential-stuffing detection engine", style="app.subtitle")
@@ -70,17 +97,45 @@ class Dashboard:
         row.add_row(Text.assemble(title, subtitle), clock)
         return Panel(row, style="app.border", padding=(0, 1))
 
+    def _render_stats(self):
+        """Real-time statistics panel."""
+        table = Table.grid(padding=(0, 2), expand=True)
+        table.add_column(width=14)
+        table.add_column(width=10)
+        table.add_column(width=14)
+        table.add_column(width=10)
+
+        stats = self._stats
+        total = stats["total_attempts"]
+        failed = stats["total_failed"]
+        success_rate = f"{(stats['total_success']/total*100):.1f}%" if total > 0 else "—"
+
+        table.add_row(
+            Text(f"Total: {total}", style="value.accent"),
+            Text(f"Failed: {failed}", style="stream.fail"),
+            Text(f"Success: {success_rate}", style="stream.success"),
+            Text(f"IPs: {len(stats['unique_ips'])}", style="value.info"),
+        )
+        return Panel(table, title="[panel.header]real-time stats[/]", border_style="app.border")
+
     def _render_stream(self):
         table = Table.grid(padding=(0, 1), expand=True)
         table.add_column(width=9)
         table.add_column(width=16)
         table.add_column(width=14)
+        table.add_column(width=8)
         table.add_column()
-        for ts, ip, account, success in list(self.recent_stream)[:10]:
+        for item in list(self.recent_stream)[:10]:
+            ts, ip, account, success, country = item if len(item) == 5 else (*item, "??")
             tstr = time.strftime("%H:%M:%S", time.localtime(ts))
             status = Text("OK", style="stream.success") if success else Text("FAIL", style="stream.fail")
-            table.add_row(Text(tstr, style="text.muted"), Text(ip, style="text.normal"),
-                          Text(account, style="value.info"), status)
+            table.add_row(
+                Text(tstr, style="text.muted"),
+                Text(ip, style="text.normal"),
+                Text(account, style="value.info"),
+                Text(country, style="value.secondary"),
+                status,
+            )
         if not self.recent_stream:
             table.add_row(Text("waiting for attempts…", style="text.muted"))
         return Panel(table, title="[panel.header]live attempt stream[/]", border_style="app.border")
@@ -97,9 +152,9 @@ class Dashboard:
 
     def _render_offenders(self, ip_scores, acct_scores):
         table = Table(expand=True, show_edge=False, header_style="panel.header")
-        table.add_column("Entity")
+        table.add_column("Entity", ratio=2)
         table.add_column("Type", width=8)
-        table.add_column("Risk", width=30)
+        table.add_column("Risk", ratio=3)
         table.add_column("Tier", width=10)
 
         combined = sorted(ip_scores + acct_scores, key=lambda r: r.score, reverse=True)[:10]
@@ -117,10 +172,10 @@ class Dashboard:
         return Panel(table, title="[panel.header]top offenders — risk ranking[/]", border_style="app.border")
 
     def _render_alerts(self):
-        rows = self.db.recent_alerts(limit=6)
+        rows = self.db.recent_alerts(limit=8)
         table = Table.grid(padding=(0, 1), expand=True)
         table.add_column(width=9)
-        table.add_column(width=10)
+        table.add_column(width=12)
         table.add_column(width=10)
         table.add_column()
         for ts, entity, entity_type, score, tier, reason in rows:
@@ -130,14 +185,52 @@ class Dashboard:
                 Text(tstr, style="text.muted"),
                 Text(entity, style="value.accent"),
                 Text(tier, style=tier_style),
-                Text(reason[:70], style="text.muted"),
+                Text(reason[:65], style="text.muted"),
             )
         if not rows:
             table.add_row(Text("no alerts yet", style="text.muted"))
         return Panel(table, title="[panel.header]recent alerts[/]", border_style="app.border")
 
+    def _render_threat_summary(self):
+        """Threat intelligence summary panel."""
+        threat_count = self._get_threat_count()
+        alert_total, alert_by_tier = self._get_alert_stats()
+
+        table = Table.grid(padding=(0, 2), expand=True)
+        table.add_column(width=20)
+        table.add_column()
+
+        table.add_row(
+            Text("Threat IPs:", style="text.muted"),
+            Text(str(threat_count), style="value.accent"),
+        )
+
+        # Alert breakdown by tier
+        tier_parts = []
+        for tier in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+            count = alert_by_tier.get(tier, 0)
+            if count > 0:
+                style = TIER_STYLE.get(tier, "text.normal")
+                tier_parts.append(Text(f"{tier}:{count} ", style=style))
+
+        table.add_row(
+            Text("Alerts:", style="text.muted"),
+            Text.assemble(*tier_parts) if tier_parts else Text("0", style="text.muted"),
+        )
+
+        countries = self._stats["countries_seen"]
+        table.add_row(
+            Text("Countries:", style="text.muted"),
+            Text(str(len(countries)) if countries else "0", style="value.info"),
+        )
+
+        return Panel(table, title="[panel.header]threat summary[/]", border_style="app.border")
+
     def _render_footer(self):
-        text = Text("q quit   ·   r reset view   ·   config.toml to tune thresholds", style="text.muted")
+        text = Text(
+            "q quit  |  live: credbrt live --rate 5  |  simulate: credbrt simulate full  |  threats: credbrt threats --load-defaults",
+            style="text.muted"
+        )
         return Panel(Align.center(text), border_style="app.border")
 
     def render(self) -> Layout:
@@ -154,6 +247,7 @@ class Dashboard:
             Layout(name="right", ratio=3),
         )
         layout["left"].split_column(
+            Layout(self._render_stats(), size=5),
             Layout(self._render_activity(), size=8),
             Layout(self._render_stream()),
         )
