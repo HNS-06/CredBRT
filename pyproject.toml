@@ -1,0 +1,21 @@
+[project]
+name = "credential-brt"
+version = "1.0.0"
+description = "Terminal-based brute-force & credential-stuffing detection engine"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.7",
+    "tomli>=2.0",
+    "tomli_w>=1.0",
+]
+
+[project.scripts]
+credbrt = "credbrt.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["credbrt*"]
